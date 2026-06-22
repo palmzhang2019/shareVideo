@@ -20,6 +20,7 @@
         nicknameLabel: document.getElementById("nickname-label"),
         copyLink: document.getElementById("copy-link-btn"),
         shareLink: document.getElementById("share-link-input"),
+        uploadTrigger: document.getElementById("upload-trigger-btn"),
         uploadInput: document.getElementById("upload-input"),
         uploadStatus: document.getElementById("upload-status"),
         roomStatus: document.getElementById("room-status"),
@@ -53,8 +54,12 @@
         optimisticDanmaku: new Map(),
         nextLane: 0,
         danmakuDraft: "",
+        uploadInFlight: false,
         isTouchDevice: detectTouchDevice(),
     };
+
+    const UPLOAD_RETRY_LIMIT = 4;
+    const UPLOAD_RETRY_BASE_DELAY = 1200;
 
     function detectTouchDevice() {
         return (
@@ -73,6 +78,11 @@
         elements.uploadStatus.textContent = text;
     }
 
+    function setUploadEnabled(enabled) {
+        elements.uploadInput.disabled = !enabled;
+        elements.uploadTrigger.setAttribute("aria-disabled", String(!enabled));
+    }
+
     function formatTime(totalSeconds) {
         if (!Number.isFinite(totalSeconds) || totalSeconds < 0) {
             return "00:00";
@@ -86,6 +96,42 @@
             return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`;
         }
         return `${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`;
+    }
+
+    function formatBytes(totalBytes) {
+        if (!Number.isFinite(totalBytes) || totalBytes < 0) {
+            return "0 B";
+        }
+
+        const units = ["B", "KB", "MB", "GB", "TB"];
+        let value = totalBytes;
+        let unitIndex = 0;
+        while (value >= 1024 && unitIndex < units.length - 1) {
+            value /= 1024;
+            unitIndex += 1;
+        }
+        const digits = value >= 100 || unitIndex === 0 ? 0 : 1;
+        return `${value.toFixed(digits)} ${units[unitIndex]}`;
+    }
+
+    function uploadProgressLabel(fileName, uploadedBytes, totalBytes, resumed = false) {
+        const safeTotal = Math.max(totalBytes, 1);
+        const percent = Math.min(100, Math.floor((uploadedBytes / safeTotal) * 100));
+        const prefix = resumed ? "继续上传" : "上传中";
+        return `${prefix} ${percent}%：${fileName} (${formatBytes(uploadedBytes)} / ${formatBytes(totalBytes)})`;
+    }
+
+    function sleep(milliseconds) {
+        return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+    }
+
+    function shouldRetryUpload(statusCode) {
+        return statusCode === 408 || statusCode === 409 || statusCode === 425 ||
+            statusCode === 429 || statusCode >= 500;
+    }
+
+    async function readJsonSafely(response) {
+        return response.json().catch(() => ({}));
     }
 
     function updateTimeLabel(currentTime = 0, duration = 0) {
@@ -518,31 +564,156 @@
         }
     }
 
-    async function uploadSelectedFile(file) {
-        if (!file) {
-            return;
-        }
+    async function initUploadSession(file) {
+        const response = await fetch(`/room/${encodeURIComponent(context.roomId)}/upload`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+                filename: file.name,
+                size: file.size,
+                last_modified: file.lastModified || 0,
+            }),
+        });
 
-        setUploadStatus(`上传中：${file.name}`);
-        try {
-            const response = await fetch(`/room/${encodeURIComponent(context.roomId)}/upload`, {
+        const payload = await readJsonSafely(response);
+        if (!response.ok) {
+            throw new Error(payload.detail || "初始化上传失败");
+        }
+        return payload;
+    }
+
+    async function sendUploadChunk(file, uploadId, offset, chunkSize) {
+        const end = Math.min(offset + chunkSize, file.size);
+        const blob = file.slice(offset, end);
+        const response = await fetch(
+            `/room/${encodeURIComponent(context.roomId)}/upload/${encodeURIComponent(uploadId)}/chunk`,
+            {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/octet-stream",
-                    "X-Filename": encodeURIComponent(file.name),
+                    "X-Upload-Offset": String(offset),
+                    "X-Upload-Chunk-Bytes": String(blob.size),
                 },
-                body: file,
-            });
+                body: blob,
+            }
+        );
+        const payload = await readJsonSafely(response);
+        return {response, payload};
+    }
 
-            if (!response.ok) {
-                const errorPayload = await response.json().catch(() => ({}));
-                throw new Error(errorPayload.detail || "上传失败");
+    async function completeUploadSession(uploadId) {
+        const response = await fetch(
+            `/room/${encodeURIComponent(context.roomId)}/upload/${encodeURIComponent(uploadId)}/complete`,
+            {method: "POST"}
+        );
+        const payload = await readJsonSafely(response);
+        if (!response.ok) {
+            throw new Error(payload.detail || "完成上传失败");
+        }
+        return payload;
+    }
+
+    async function uploadChunkWithRetry(file, session, offset) {
+        let currentSession = session;
+        let lastError = null;
+
+        for (let attempt = 1; attempt <= UPLOAD_RETRY_LIMIT; attempt += 1) {
+            try {
+                const {response, payload} = await sendUploadChunk(
+                    file,
+                    currentSession.upload_id,
+                    offset,
+                    currentSession.chunk_size
+                );
+
+                if (response.ok) {
+                    return {
+                        session: currentSession,
+                        uploadedBytes: payload.uploaded_bytes,
+                    };
+                }
+
+                if (response.status === 409 && Number.isFinite(payload.uploaded_bytes)) {
+                    return {
+                        session: currentSession,
+                        uploadedBytes: payload.uploaded_bytes,
+                    };
+                }
+
+                if (response.status === 404) {
+                    currentSession = await initUploadSession(file);
+                    continue;
+                }
+
+                const error = new Error(payload.detail || "上传分片失败");
+                if (!shouldRetryUpload(response.status)) {
+                    error.nonRetriable = true;
+                    throw error;
+                }
+                lastError = error;
+            } catch (error) {
+                if (error && error.nonRetriable) {
+                    throw error;
+                }
+                lastError = error;
             }
 
-            setUploadStatus(`上传完成：${file.name}`);
+            if (attempt >= UPLOAD_RETRY_LIMIT) {
+                break;
+            }
+
+            setUploadStatus(`${uploadProgressLabel(file.name, offset, file.size, offset > 0)}，正在重试`);
+            await sleep(UPLOAD_RETRY_BASE_DELAY * attempt);
+
+            try {
+                currentSession = await initUploadSession(file);
+            } catch (error) {
+                lastError = error;
+            }
+        }
+
+        throw lastError || new Error("上传失败");
+    }
+
+    async function uploadSelectedFile(file) {
+        if (!file || state.uploadInFlight) {
+            return;
+        }
+
+        state.uploadInFlight = true;
+        setUploadEnabled(false);
+
+        try {
+            let session = await initUploadSession(file);
+            let uploadedBytes = Number(session.uploaded_bytes || 0);
+            if (!Number.isFinite(uploadedBytes) || uploadedBytes < 0 || uploadedBytes > file.size) {
+                throw new Error("服务器返回了无效的上传进度");
+            }
+
+            setUploadStatus(uploadProgressLabel(file.name, uploadedBytes, file.size, uploadedBytes > 0));
+
+            while (uploadedBytes < file.size) {
+                const outcome = await uploadChunkWithRetry(file, session, uploadedBytes);
+                session = outcome.session;
+
+                if (!Number.isFinite(outcome.uploadedBytes) || outcome.uploadedBytes < uploadedBytes) {
+                    throw new Error("上传进度回退，已中止");
+                }
+
+                uploadedBytes = Math.min(file.size, outcome.uploadedBytes);
+                setUploadStatus(uploadProgressLabel(file.name, uploadedBytes, file.size, uploadedBytes > 0));
+            }
+
+            setUploadStatus(`正在提交：${file.name}`);
+            await completeUploadSession(session.upload_id);
+            setUploadStatus(`上传完成：${file.name} (${formatBytes(file.size)})`);
         } catch (error) {
             setUploadStatus(error.message || "上传失败");
         } finally {
+            state.uploadInFlight = false;
+            setUploadEnabled(true);
             elements.uploadInput.value = "";
         }
     }
@@ -808,6 +979,7 @@
     updateTimeLabel(0, 0);
     syncDanmakuDraft("");
     updateFullscreenUi();
+    setUploadEnabled(true);
     setRoomStatus("正在连接房间...");
     loadHistoryDanmaku().catch(() => {});
     connectWebSocket();
