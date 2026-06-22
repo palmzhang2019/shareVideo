@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Shared Cinema</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="landing-body">
+<main class="landing-shell">
+    <section class="hero-card">
+        <p class="eyebrow">Shared Cinema</p>
+        <h1>一个链接，几个人，同步看同一部片。</h1>
+        <p class="hero-copy">
+            单进程、小内存、无外部依赖。创建房间后把链接发出去，任意一人上传本地视频，房间里所有人就能同步播放和发弹幕。
+        </p>
+        <div class="hero-actions">
+            <button id="create-room-btn" class="primary-btn large-btn" type="button">创建房间</button>
+            <span id="create-room-status" class="status-text">准备就绪</span>
+        </div>
+    </section>
+</main>
+
+<script>
+    const createButton = document.getElementById("create-room-btn");
+    const statusNode = document.getElementById("create-room-status");
+
+    createButton.addEventListener("click", async () => {
+        createButton.disabled = true;
+        statusNode.textContent = "正在创建房间...";
+        try {
+            const response = await fetch("/api/rooms", {method: "POST"});
+            if (!response.ok) {
+                throw new Error("创建房间失败");
+            }
+            const payload = await response.json();
+            window.location.href = `/room/${payload.room_id}`;
+        } catch (error) {
+            statusNode.textContent = error.message || "创建失败";
+            createButton.disabled = false;
+        }
+    });
+</script>
+</body>
+</html>

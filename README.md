@@ -1,0 +1,76 @@
+# Shared Cinema
+
+一个单进程、低内存占用的共享观影服务。多个用户打开同一房间链接后，可以共同观看同一部本地上传的视频，播放/暂停/拖动进度实时同步，并支持绑定时间轴的弹幕。
+
+## 特性
+
+- FastAPI + 原生 WebSocket，同房间 2 到 10 人规模可用
+- 视频上传使用 `request.stream()` 流式落盘，单次写入块不超过 1MB
+- 视频播放使用 `FileResponse`，天然支持 HTTP Range
+- 房间状态在内存，弹幕历史持久化到 SQLite
+- 原生 HTML/CSS/JS，无构建步骤，手机与桌面端都可直接打开
+
+## 环境要求
+
+- Python 3.11+
+
+## 创建虚拟环境
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+## 安装与启动
+
+```bash
+pip install -r requirements.txt
+uvicorn app:app --host 0.0.0.0 --port 8000
+```
+
+然后打开：
+
+```text
+http://127.0.0.1:8000/
+```
+
+## 使用流程
+
+1. 进入 `/` 点击“创建房间”
+2. 页面会跳转到 `/room/{room_id}`
+3. 点击“选择视频”上传本地文件
+4. 把页面里的分享链接发给其他人
+5. 任意人播放、暂停、拖动进度，其他人会在约 1 秒内同步
+6. 点击“发弹幕”发送文本，自己的弹幕是金色，别人的弹幕是白色
+
+## 项目结构
+
+```text
+shared_cinema/
+├── app.py
+├── db.py
+├── requirements.txt
+├── README.md
+├── static/
+│   ├── app.js
+│   └── style.css
+├── templates/
+│   ├── index.html
+│   └── room.html
+└── data/
+    ├── shared_cinema.sqlite3
+    └── videos/
+```
+
+## 设计说明
+
+- 上传接口不是 `multipart/form-data`，而是前端直接把 `File` 作为请求体发送。这样后端可以直接用 `request.stream()` 分块写入磁盘，避免大文件先被表单解析器缓存。
+- 一个房间同一时刻只保留一个视频。上传新视频后，旧视频文件会被删除，房间播放状态重置为暂停、进度回到 0。
+- 房间播放状态只保存在进程内。服务重启后，同步状态会丢失，但 SQLite 中的弹幕历史仍然保留。
+- `data/` 是运行期目录，会自动生成。
+
+## 常见说明
+
+- 如果视频文件很大，请确保服务器磁盘空间足够
+- 服务默认无鉴权，拿到房间链接的人都能加入
+- 建议在同一内网或小范围场景下使用

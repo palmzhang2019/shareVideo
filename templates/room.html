@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>房间 {{ room_id }} - Shared Cinema</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="app-shell">
+    <header class="topbar">
+        <div>
+            <p class="eyebrow">Shared Cinema</p>
+            <h1>房间 {{ room_id }}</h1>
+            <p id="nickname-label" class="subtle-text">连接中...</p>
+        </div>
+        <div class="room-meta">
+            <span id="viewer-count" class="pill">在线 0</span>
+            <button id="copy-link-btn" class="secondary-btn" type="button">复制链接</button>
+        </div>
+    </header>
+
+    <main class="room-layout">
+        <section class="player-card">
+            <div class="video-stage">
+                <video id="video-player" playsinline preload="metadata"></video>
+                <div id="danmaku-layer" class="danmaku-layer"></div>
+                <div id="join-overlay" class="join-overlay visible">
+                    <div class="join-overlay-panel">
+                        <h2>点击加入播放</h2>
+                        <p>移动端需要一次用户手势，之后才能接受远端同步播放。</p>
+                        <button id="join-playback-btn" class="primary-btn large-btn" type="button">加入播放</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="control-panel">
+                <div class="transport-row">
+                    <button id="play-pause-btn" class="primary-btn control-btn" type="button" disabled>播放</button>
+                    <input id="progress-range" class="progress-range" type="range" min="0" max="0" value="0" step="0.1" disabled>
+                    <span id="time-label" class="time-label">00:00 / 00:00</span>
+                </div>
+
+                <div class="action-row">
+                    <label class="secondary-btn upload-btn">
+                        <input id="upload-input" type="file" accept="video/*" hidden>
+                        选择视频
+                    </label>
+                    <span id="upload-status" class="status-text">等待上传</span>
+                </div>
+
+                <div class="action-row">
+                    <input id="danmaku-input" class="text-input" type="text" maxlength="120" placeholder="输入弹幕内容">
+                    <button id="send-danmaku-btn" class="accent-btn" type="button">发弹幕</button>
+                </div>
+            </div>
+        </section>
+
+        <aside class="sidebar-card">
+            <div class="info-block">
+                <h2>分享链接</h2>
+                <input id="share-link-input" class="text-input" type="text" readonly value="{{ share_url }}">
+            </div>
+            <div class="info-block">
+                <h2>状态</h2>
+                <p id="room-status" class="subtle-text">等待视频上传</p>
+            </div>
+            <div class="info-block">
+                <h2>说明</h2>
+                <p class="subtle-text">任意人都可以上传、播放、暂停、拖动进度和发送弹幕。上传新视频会替换当前视频，并把进度重置为 0。</p>
+            </div>
+        </aside>
+    </main>
+</div>
+
+<script>
+    window.__ROOM_CONTEXT__ = {
+        roomId: {{ room_id|tojson }},
+        shareUrl: {{ share_url|tojson }}
+    };
+</script>
+<script src="/static/app.js"></script>
+</body>
+</html>
