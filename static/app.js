@@ -5,11 +5,15 @@
     }
 
     const elements = {
+        documentElement: document.documentElement,
+        body: document.body,
+        playerShell: document.getElementById("player-shell"),
         video: document.getElementById("video-player"),
         danmakuLayer: document.getElementById("danmaku-layer"),
         joinOverlay: document.getElementById("join-overlay"),
         joinButton: document.getElementById("join-playback-btn"),
         playPause: document.getElementById("play-pause-btn"),
+        fullscreenToggle: document.getElementById("fullscreen-toggle-btn"),
         progress: document.getElementById("progress-range"),
         timeLabel: document.getElementById("time-label"),
         viewerCount: document.getElementById("viewer-count"),
@@ -21,6 +25,10 @@
         roomStatus: document.getElementById("room-status"),
         danmakuInput: document.getElementById("danmaku-input"),
         sendDanmaku: document.getElementById("send-danmaku-btn"),
+        fullscreenDanmakuComposer: document.getElementById("fullscreen-danmaku-composer"),
+        fullscreenDanmakuTrigger: document.getElementById("fullscreen-danmaku-trigger-btn"),
+        fullscreenDanmakuInput: document.getElementById("fullscreen-danmaku-input"),
+        fullscreenSendDanmaku: document.getElementById("fullscreen-send-danmaku-btn"),
     };
 
     const state = {
@@ -36,12 +44,26 @@
         suppressTimer: null,
         isVideoReady: false,
         isScrubbing: false,
+        isPseudoFullscreen: false,
+        isFullscreenComposerActive: false,
+        fullscreenComposerTimer: null,
         lastDanmakuScanTime: 0,
         danmakuHistory: [],
         renderedDanmakuIds: new Set(),
         optimisticDanmaku: new Map(),
         nextLane: 0,
+        danmakuDraft: "",
+        isTouchDevice: detectTouchDevice(),
     };
+
+    function detectTouchDevice() {
+        return (
+            window.matchMedia("(pointer: coarse)").matches ||
+            navigator.maxTouchPoints > 0 ||
+            "ontouchstart" in window ||
+            /android|iphone|ipad|ipod|mobile/i.test(navigator.userAgent)
+        );
+    }
 
     function setRoomStatus(text) {
         elements.roomStatus.textContent = text;
@@ -190,6 +212,152 @@
         }
         updateTimeLabel(elements.video.currentTime || 0, duration);
         elements.playPause.textContent = elements.video.paused ? "播放" : "暂停";
+    }
+
+    function syncDanmakuDraft(value, source = null) {
+        state.danmakuDraft = value;
+        if (source !== elements.danmakuInput) {
+            elements.danmakuInput.value = value;
+        }
+        if (source !== elements.fullscreenDanmakuInput) {
+            elements.fullscreenDanmakuInput.value = value;
+        }
+    }
+
+    function clearFullscreenComposerTimer() {
+        window.clearTimeout(state.fullscreenComposerTimer);
+        state.fullscreenComposerTimer = null;
+    }
+
+    function isNativeFullscreenActive() {
+        return (
+            document.fullscreenElement === elements.playerShell ||
+            document.webkitFullscreenElement === elements.playerShell
+        );
+    }
+
+    function isFullscreenActive() {
+        return state.isPseudoFullscreen || isNativeFullscreenActive();
+    }
+
+    function scheduleFullscreenComposerIdle() {
+        if (!state.isTouchDevice || !isFullscreenActive()) {
+            return;
+        }
+        clearFullscreenComposerTimer();
+        state.fullscreenComposerTimer = window.setTimeout(() => {
+            if (document.activeElement !== elements.fullscreenDanmakuInput) {
+                setFullscreenComposerActive(false);
+            }
+        }, 4000);
+    }
+
+    function setFullscreenComposerActive(active, options = {}) {
+        const {restartTimer = false} = options;
+        state.isFullscreenComposerActive = active;
+        elements.fullscreenDanmakuComposer.classList.toggle("is-active", active);
+
+        if (!active) {
+            clearFullscreenComposerTimer();
+            return;
+        }
+
+        if (state.isTouchDevice && restartTimer) {
+            scheduleFullscreenComposerIdle();
+        } else {
+            clearFullscreenComposerTimer();
+        }
+    }
+
+    function updateFullscreenUi() {
+        const fullscreen = isFullscreenActive();
+        elements.documentElement.classList.toggle("is-fullscreen", fullscreen);
+        elements.body.classList.toggle("is-fullscreen", fullscreen);
+        elements.playerShell.classList.toggle("is-fullscreen", fullscreen);
+        elements.playerShell.classList.toggle("pseudo-fullscreen", state.isPseudoFullscreen);
+        elements.fullscreenDanmakuComposer.setAttribute("aria-hidden", String(!fullscreen));
+        elements.fullscreenToggle.textContent = fullscreen ? "退出全屏" : "全屏";
+        elements.fullscreenToggle.setAttribute("aria-pressed", String(fullscreen));
+
+        if (!fullscreen) {
+            setFullscreenComposerActive(false);
+            if (document.activeElement === elements.fullscreenDanmakuInput) {
+                elements.fullscreenDanmakuInput.blur();
+            }
+        } else {
+            syncDanmakuDraft(state.danmakuDraft);
+            setFullscreenComposerActive(false);
+        }
+    }
+
+    async function requestNativeFullscreen() {
+        const requestFullscreen =
+            elements.playerShell.requestFullscreen ||
+            elements.playerShell.webkitRequestFullscreen;
+        if (!requestFullscreen) {
+            throw new Error("Fullscreen API unavailable");
+        }
+
+        const result = requestFullscreen.call(elements.playerShell);
+        if (result && typeof result.then === "function") {
+            await result;
+        }
+    }
+
+    async function exitNativeFullscreen() {
+        const exitFullscreen = document.exitFullscreen || document.webkitExitFullscreen;
+        if (!exitFullscreen) {
+            return;
+        }
+
+        const result = exitFullscreen.call(document);
+        if (result && typeof result.then === "function") {
+            await result;
+        }
+    }
+
+    function enablePseudoFullscreen() {
+        state.isPseudoFullscreen = true;
+        updateFullscreenUi();
+    }
+
+    function disablePseudoFullscreen() {
+        state.isPseudoFullscreen = false;
+        updateFullscreenUi();
+    }
+
+    async function enterFullscreenMode() {
+        if (state.isTouchDevice) {
+            enablePseudoFullscreen();
+            return;
+        }
+
+        try {
+            await requestNativeFullscreen();
+        } catch (error) {
+            enablePseudoFullscreen();
+        }
+    }
+
+    async function exitFullscreenMode() {
+        if (state.isPseudoFullscreen) {
+            disablePseudoFullscreen();
+            return;
+        }
+
+        if (isNativeFullscreenActive()) {
+            await exitNativeFullscreen();
+        } else {
+            disablePseudoFullscreen();
+        }
+    }
+
+    async function toggleFullscreenMode() {
+        if (isFullscreenActive()) {
+            await exitFullscreenMode();
+            return;
+        }
+        await enterFullscreenMode();
     }
 
     async function ensureVideoSource(videoUrl) {
@@ -380,9 +548,9 @@
     }
 
     function sendDanmaku() {
-        const text = elements.danmakuInput.value.trim();
+        const text = state.danmakuDraft.trim();
         if (!text || !state.clientId || !state.isVideoReady) {
-            return;
+            return false;
         }
 
         const videoTime = Number(elements.video.currentTime || 0);
@@ -397,8 +565,84 @@
             text,
             video_time: videoTime,
         });
-        elements.danmakuInput.value = "";
+        syncDanmakuDraft("");
+        if (document.activeElement === elements.fullscreenDanmakuInput) {
+            elements.fullscreenDanmakuInput.blur();
+        }
+        setFullscreenComposerActive(false);
+        return true;
     }
+
+    function handleDanmakuInputSync(event) {
+        syncDanmakuDraft(event.target.value, event.target);
+        if (event.target === elements.fullscreenDanmakuInput) {
+            setFullscreenComposerActive(true, {restartTimer: state.isTouchDevice});
+        }
+    }
+
+    function handleDanmakuInputKeydown(event) {
+        event.stopPropagation();
+
+        if (event.key === "Enter") {
+            event.preventDefault();
+            sendDanmaku();
+            return;
+        }
+
+        if (event.key === "Escape") {
+            event.preventDefault();
+            event.target.blur();
+            if (event.target === elements.fullscreenDanmakuInput) {
+                setFullscreenComposerActive(false);
+            }
+        }
+    }
+
+    function bindDanmakuInput(input) {
+        input.addEventListener("input", handleDanmakuInputSync);
+        input.addEventListener("keydown", handleDanmakuInputKeydown);
+        input.addEventListener("keypress", (event) => event.stopPropagation());
+        input.addEventListener("keyup", (event) => event.stopPropagation());
+    }
+
+    bindDanmakuInput(elements.danmakuInput);
+    bindDanmakuInput(elements.fullscreenDanmakuInput);
+
+    elements.fullscreenDanmakuInput.addEventListener("focus", () => {
+        setFullscreenComposerActive(true);
+    });
+
+    elements.fullscreenDanmakuInput.addEventListener("blur", () => {
+        window.setTimeout(() => {
+            if (document.activeElement !== elements.fullscreenDanmakuInput) {
+                setFullscreenComposerActive(false);
+            }
+        }, 0);
+    });
+
+    elements.fullscreenDanmakuComposer.addEventListener("mouseenter", () => {
+        if (!state.isTouchDevice && isFullscreenActive()) {
+            setFullscreenComposerActive(true);
+        }
+    });
+
+    elements.fullscreenDanmakuComposer.addEventListener("mouseleave", () => {
+        if (!state.isTouchDevice && document.activeElement !== elements.fullscreenDanmakuInput) {
+            setFullscreenComposerActive(false);
+        }
+    });
+
+    elements.fullscreenDanmakuComposer.addEventListener("pointerdown", () => {
+        if (!isFullscreenActive()) {
+            return;
+        }
+        setFullscreenComposerActive(true, {restartTimer: state.isTouchDevice});
+    });
+
+    elements.fullscreenDanmakuTrigger.addEventListener("click", () => {
+        setFullscreenComposerActive(true, {restartTimer: state.isTouchDevice});
+        elements.fullscreenDanmakuInput.focus();
+    });
 
     elements.joinButton.addEventListener("click", unlockPlayback);
 
@@ -418,6 +662,11 @@
         } else {
             elements.video.pause();
         }
+    });
+
+    elements.fullscreenToggle.addEventListener("click", async () => {
+        state.hasUserGesture = true;
+        await toggleFullscreenMode();
     });
 
     elements.video.addEventListener("click", async () => {
@@ -508,10 +757,39 @@
     });
 
     elements.sendDanmaku.addEventListener("click", sendDanmaku);
-    elements.danmakuInput.addEventListener("keydown", (event) => {
-        if (event.key === "Enter") {
+    elements.fullscreenSendDanmaku.addEventListener("click", sendDanmaku);
+
+    document.addEventListener("pointerdown", (event) => {
+        if (!state.isTouchDevice || !isFullscreenActive()) {
+            return;
+        }
+
+        if (elements.fullscreenDanmakuComposer.contains(event.target)) {
+            return;
+        }
+
+        if (document.activeElement === elements.fullscreenDanmakuInput) {
+            elements.fullscreenDanmakuInput.blur();
+        }
+        setFullscreenComposerActive(false);
+    });
+
+    document.addEventListener("fullscreenchange", () => {
+        if (!state.isPseudoFullscreen) {
+            updateFullscreenUi();
+        }
+    });
+
+    document.addEventListener("webkitfullscreenchange", () => {
+        if (!state.isPseudoFullscreen) {
+            updateFullscreenUi();
+        }
+    });
+
+    document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && state.isPseudoFullscreen) {
             event.preventDefault();
-            sendDanmaku();
+            exitFullscreenMode().catch(() => {});
         }
     });
 
@@ -528,6 +806,8 @@
 
     updateControlsAvailability();
     updateTimeLabel(0, 0);
+    syncDanmakuDraft("");
+    updateFullscreenUi();
     setRoomStatus("正在连接房间...");
     loadHistoryDanmaku().catch(() => {});
     connectWebSocket();
