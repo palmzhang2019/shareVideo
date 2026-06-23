@@ -150,6 +150,16 @@
         elements.joinOverlay.classList.toggle("visible", visible);
     }
 
+    function describeStreamStatus(streamStatus) {
+        if (streamStatus === "processing") {
+            return "HLS 已开始可播，服务器仍在继续生成后续分片";
+        }
+        if (streamStatus === "failed") {
+            return "HLS 生成失败，当前使用 MP4 直链播放";
+        }
+        return "视频已就绪，可以开始同步播放";
+    }
+
     function canPlayNativeHls() {
         return elements.video.canPlayType("application/vnd.apple.mpegurl") !== "";
     }
@@ -507,6 +517,7 @@
         const videoUrl = source && source.video_url;
         const videoType = source && source.video_type;
         const fallbackUrl = source && source.fallback_video_url;
+        const streamStatus = source && source.stream_status;
         const sourceKey = `${videoType || ""}|${videoUrl || ""}|${fallbackUrl || ""}`;
 
         if (!videoUrl || state.currentSourceKey === sourceKey) {
@@ -528,7 +539,7 @@
         }
 
         resetDanmakuWindow(0);
-        setRoomStatus("视频已就绪，可以开始同步播放");
+        setRoomStatus(describeStreamStatus(streamStatus));
     }
 
     async function applyRemoteState(message) {
@@ -650,7 +661,17 @@
             }
 
             if (payload.type === "video_ready") {
-                setRoomStatus("视频上传完成，正在同步加载");
+                if (payload.stream_status === "processing") {
+                    if (payload.video_type === "application/vnd.apple.mpegurl") {
+                        setRoomStatus("HLS 已开始可播，正在同步切换播放源");
+                    } else {
+                        setRoomStatus("视频上传完成，MP4 已可播放，HLS 正在后台生成");
+                    }
+                } else if (payload.stream_status === "ready") {
+                    setRoomStatus("HLS 已就绪，正在同步切换播放源");
+                } else {
+                    setRoomStatus("视频上传完成，正在同步加载");
+                }
                 if (payload.video_url) {
                     await ensureVideoSource(payload);
                 }
@@ -818,9 +839,13 @@
                 setUploadStatus(uploadProgressLabel(file.name, uploadedBytes, file.size, uploadedBytes > 0));
             }
 
-            setUploadStatus(`正在生成 HLS：${file.name}`);
-            await completeUploadSession(session.upload_id);
-            setUploadStatus(`上传完成：${file.name} (${formatBytes(file.size)})`);
+            setUploadStatus(`正在提交：${file.name}`);
+            const completion = await completeUploadSession(session.upload_id);
+            if (completion.stream_status === "processing") {
+                setUploadStatus(`上传完成，HLS 正在后台生成：${file.name}`);
+            } else {
+                setUploadStatus(`上传完成：${file.name} (${formatBytes(file.size)})`);
+            }
         } catch (error) {
             setUploadStatus(error.message || "上传失败");
         } finally {

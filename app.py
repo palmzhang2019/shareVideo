@@ -57,8 +57,10 @@ ANIMALS = [
 @dataclass
 class RoomState:
     room_id: str
+    media_upload_id: str | None = None
     video_filename: str | None = None
     stream_manifest: str | None = None
+    stream_status: str = "none"
     video_ready: bool = False
     is_playing: bool = False
     position: float = 0.0
@@ -92,7 +94,8 @@ templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 ROOMS: dict[str, RoomState] = {}
 CLIENTS: dict[WebSocket, ClientMeta] = {}
 UPLOAD_LOCKS: dict[str, asyncio.Lock] = {}
-HLS_MASTER_PLAYLIST = "master.m3u8"
+HLS_TASKS: dict[str, asyncio.Task[None]] = {}
+HLS_PLAYLIST = "index.m3u8"
 
 
 @dataclass(frozen=True)
@@ -335,44 +338,14 @@ def even_dimension(value: int) -> int:
     return max(2, value - (value % 2))
 
 
-def choose_hls_variants(source_height: int) -> list[HlsVariant]:
+def choose_hls_variant(source_height: int) -> HlsVariant:
     normalized_height = even_dimension(max(source_height, 360))
 
     if normalized_height >= 720:
-        candidates = [
-            HlsVariant("360p", 360, 700, 770, 1050, 96),
-            HlsVariant("720p", 720, 2200, 2420, 3300, 128),
-        ]
-    elif normalized_height >= 480:
-        candidates = [
-            HlsVariant("360p", 360, 700, 770, 1050, 96),
-            HlsVariant(f"{normalized_height}p", normalized_height, 1400, 1540, 2100, 128),
-        ]
-    else:
-        candidates = [
-            HlsVariant(f"{normalized_height}p", normalized_height, 650, 715, 975, 96),
-        ]
-
-    unique_variants: dict[int, HlsVariant] = {}
-    for variant in candidates:
-        unique_variants[variant.target_height] = variant
-    return sorted(unique_variants.values(), key=lambda item: item.target_height)
-
-
-def scaled_dimensions(
-    source_width: int, source_height: int, target_height: int
-) -> tuple[int, int]:
-    if source_width <= 0 or source_height <= 0:
-        return (640, target_height)
-
-    if source_height <= target_height:
-        return (even_dimension(source_width), even_dimension(source_height))
-
-    scale = target_height / source_height
-    return (
-        even_dimension(int(source_width * scale)),
-        even_dimension(int(source_height * scale)),
-    )
+        return HlsVariant("720p", 720, 1600, 1760, 2400, 128)
+    if normalized_height >= 480:
+        return HlsVariant("480p", 480, 1100, 1210, 1650, 96)
+    return HlsVariant(f"{normalized_height}p", normalized_height, 650, 715, 975, 96)
 
 
 async def probe_media(path: Path) -> tuple[int, int, bool]:
@@ -415,19 +388,24 @@ async def probe_media(path: Path) -> tuple[int, int, bool]:
     return (width, height, has_audio)
 
 
-async def transcode_hls_variant(
+async def start_hls_transcode(
     input_path: Path,
-    variant_dir: Path,
-    variant: HlsVariant,
-    has_audio: bool,
-) -> None:
+    room_id: str,
+    upload_id: str,
+) -> tuple[asyncio.subprocess.Process, Path, Path]:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise RuntimeError("ffmpeg is required to generate HLS output.")
 
-    variant_dir.mkdir(parents=True, exist_ok=True)
-    playlist_path = variant_dir / "index.m3u8"
-    segment_pattern = variant_dir / "segment_%03d.ts"
+    _source_width, source_height, has_audio = await probe_media(input_path)
+    variant = choose_hls_variant(source_height)
+    stream_root = get_room_hls_dir(room_id, upload_id)
+    if stream_root.exists():
+        shutil.rmtree(stream_root, ignore_errors=True)
+    stream_root.mkdir(parents=True, exist_ok=True)
+
+    playlist_path = stream_root / HLS_PLAYLIST
+    segment_pattern = stream_root / "segment_%05d.ts"
     scale_filter = (
         f"scale=w=-2:h={variant.target_height}:force_original_aspect_ratio=decrease"
     )
@@ -444,7 +422,7 @@ async def transcode_hls_variant(
         "-c:v",
         "libx264",
         "-preset",
-        "veryfast",
+        "superfast",
         "-crf",
         "23",
         "-pix_fmt",
@@ -490,9 +468,9 @@ async def transcode_hls_variant(
             "-f",
             "hls",
             "-hls_time",
-            "4",
+            "2",
             "-hls_playlist_type",
-            "vod",
+            "event",
             "-hls_list_size",
             "0",
             "-hls_flags",
@@ -508,57 +486,7 @@ async def transcode_hls_variant(
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
     )
-    await process.wait()
-    if process.returncode != 0 or not playlist_path.exists():
-        raise RuntimeError(f"Failed to generate HLS variant {variant.name}.")
-
-
-async def generate_hls_stream(input_path: Path, room_id: str, upload_id: str) -> str | None:
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        return None
-
-    source_width, source_height, has_audio = await probe_media(input_path)
-    variants = choose_hls_variants(source_height)
-    if not variants:
-        return None
-
-    stream_root = get_room_hls_dir(room_id, upload_id)
-    if stream_root.exists():
-        shutil.rmtree(stream_root, ignore_errors=True)
-    stream_root.mkdir(parents=True, exist_ok=True)
-
-    variant_entries: list[tuple[HlsVariant, tuple[int, int]]] = []
-    try:
-        for variant in variants:
-            variant_dir = stream_root / variant.name
-            await transcode_hls_variant(input_path, variant_dir, variant, has_audio)
-            variant_entries.append(
-                (variant, scaled_dimensions(source_width, source_height, variant.target_height))
-            )
-
-        master_playlist = stream_root / HLS_MASTER_PLAYLIST
-        lines = ["#EXTM3U", "#EXT-X-VERSION:3"]
-        for variant, (width, height) in variant_entries:
-            bandwidth_kbps = variant.video_bitrate_kbps
-            if has_audio:
-                bandwidth_kbps += variant.audio_bitrate_kbps
-            average_bandwidth = int(bandwidth_kbps * 0.85 * 1000)
-            lines.append(
-                (
-                    "#EXT-X-STREAM-INF:"
-                    f"BANDWIDTH={bandwidth_kbps * 1000},"
-                    f"AVERAGE-BANDWIDTH={average_bandwidth},"
-                    f"RESOLUTION={width}x{height}"
-                )
-            )
-            lines.append(f"{variant.name}/index.m3u8")
-
-        master_playlist.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        return f"{stream_root.name}/{HLS_MASTER_PLAYLIST}"
-    except Exception:
-        shutil.rmtree(stream_root, ignore_errors=True)
-        return None
+    return (process, playlist_path, stream_root)
 
 
 def current_fallback_video_url(room: RoomState) -> str | None:
@@ -583,6 +511,7 @@ def current_video_payload(room: RoomState) -> dict[str, str | None]:
             "video_url": f"/room/{quote(room.room_id)}/stream/{room.stream_manifest}?v={version}",
             "video_type": "application/vnd.apple.mpegurl",
             "fallback_video_url": fallback_video_url,
+            "stream_status": room.stream_status,
         }
 
     video_path = get_room_video_path(room)
@@ -591,12 +520,14 @@ def current_video_payload(room: RoomState) -> dict[str, str | None]:
             "video_url": fallback_video_url,
             "video_type": guess_video_media_type(video_path, room.video_filename),
             "fallback_video_url": None,
+            "stream_status": room.stream_status,
         }
 
     return {
         "video_url": None,
         "video_type": None,
         "fallback_video_url": None,
+        "stream_status": room.stream_status,
     }
 
 
@@ -641,12 +572,15 @@ def ensure_room(room_id: str) -> RoomState:
 
         manifests = [
             path
-            for path in room_dir.glob(f"hls-*/{HLS_MASTER_PLAYLIST}")
+            for path in room_dir.glob(f"hls-*/{HLS_PLAYLIST}")
             if path.is_file()
         ]
         if manifests:
             latest_manifest = max(manifests, key=lambda item: item.stat().st_mtime_ns)
             room.stream_manifest = str(latest_manifest.relative_to(room_dir))
+            room.stream_status = "ready"
+        elif room.video_ready:
+            room.stream_status = "none"
 
     ROOMS[room_id] = room
     return room
@@ -667,6 +601,109 @@ async def broadcast_json(room: RoomState, payload: dict[str, Any]) -> None:
 
 async def broadcast_viewers(room: RoomState) -> None:
     await broadcast_json(room, {"type": "viewers", "count": len(room.clients)})
+
+
+def cancel_room_hls_task(room_id: str) -> None:
+    task = HLS_TASKS.pop(room_id, None)
+    if task and not task.done():
+        task.cancel()
+
+
+async def finalize_hls_in_background(
+    room_id: str, upload_id: str, source_path: Path, video_filename: str
+) -> None:
+    stream_manifest: str | None = None
+    stream_root: Path | None = None
+    try:
+        process, playlist_path, stream_root = await start_hls_transcode(
+            source_path,
+            room_id,
+            upload_id,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        process = None
+        playlist_path = None
+
+    try:
+        if process and playlist_path and stream_root:
+            relative_manifest = f"{stream_root.name}/{playlist_path.name}"
+            announced_processing = False
+
+            while True:
+                room = ensure_room(room_id)
+                if room.media_upload_id != upload_id or room.video_filename != video_filename:
+                    with contextlib.suppress(ProcessLookupError):
+                        process.terminate()
+                    await process.wait()
+                    return
+
+                if (
+                    not announced_processing
+                    and playlist_path.exists()
+                    and playlist_path.stat().st_size > 0
+                ):
+                    room.stream_manifest = relative_manifest
+                    room.stream_status = "processing"
+                    room.updated_at = now_ms()
+                    video_payload = current_video_payload(room)
+                    await broadcast_json(room, {"type": "video_ready", **video_payload})
+                    await broadcast_json(room, serialize_state(room))
+                    announced_processing = True
+
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=0.5)
+                    break
+                except asyncio.TimeoutError:
+                    continue
+
+            if process.returncode == 0 and playlist_path.exists():
+                stream_manifest = relative_manifest
+    except asyncio.CancelledError:
+        if process:
+            with contextlib.suppress(ProcessLookupError):
+                process.terminate()
+            with contextlib.suppress(Exception):
+                await process.wait()
+        raise
+
+    room = ensure_room(room_id)
+    if room.media_upload_id != upload_id or room.video_filename != video_filename:
+        return
+
+    if stream_manifest:
+        room.stream_manifest = stream_manifest
+        room.stream_status = "ready"
+    else:
+        room.stream_manifest = None
+        room.stream_status = "failed"
+        if stream_root:
+            shutil.rmtree(stream_root, ignore_errors=True)
+
+    room.updated_at = now_ms()
+    video_payload = current_video_payload(room)
+    await broadcast_json(room, {"type": "video_ready", **video_payload})
+    await broadcast_json(room, serialize_state(room))
+
+
+def schedule_room_hls_generation(room: RoomState, upload_id: str, source_path: Path) -> None:
+    cancel_room_hls_task(room.room_id)
+
+    async def runner() -> None:
+        try:
+            await finalize_hls_in_background(
+                room.room_id,
+                upload_id,
+                source_path,
+                room.video_filename or "",
+            )
+        finally:
+            current_task = HLS_TASKS.get(room.room_id)
+            if current_task is asyncio.current_task():
+                HLS_TASKS.pop(room.room_id, None)
+
+    HLS_TASKS[room.room_id] = asyncio.create_task(runner())
 
 
 async def update_room_state(room: RoomState, is_playing: bool | None, position: float) -> None:
@@ -875,6 +912,7 @@ async def complete_upload(room_id: str, upload_id: str) -> JSONResponse:
     room = ensure_room(room_id)
     room_dir = get_room_dir(room_id)
     lock = get_room_upload_lock(room_id)
+    ffmpeg_available = shutil.which("ffmpeg") is not None
 
     async with lock:
         session = load_upload_session(room_id, upload_id)
@@ -895,18 +933,23 @@ async def complete_upload(room_id: str, upload_id: str) -> JSONResponse:
             delete_upload_artifacts(room_id, upload_id)
             clear_other_upload_artifacts(room_id)
             remove_stale_room_media(room_dir, keep_paths={final_path})
+            cancel_room_hls_task(room_id)
 
             await optimize_for_streaming(final_path)
-            stream_manifest = await generate_hls_stream(final_path, room_id, upload_id)
 
+            room.media_upload_id = upload_id
             room.video_filename = session.safe_filename
-            room.stream_manifest = stream_manifest
+            room.stream_manifest = None
+            room.stream_status = "processing" if ffmpeg_available else "none"
             room.video_ready = True
             room.is_playing = False
             room.position = 0.0
             room.updated_at = now_ms()
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"Finalize failed: {exc}") from exc
+
+    if ffmpeg_available:
+        schedule_room_hls_generation(room, upload_id, final_path)
 
     video_payload = current_video_payload(room)
     await broadcast_json(room, {"type": "video_ready", **video_payload})
