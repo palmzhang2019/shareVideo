@@ -4,6 +4,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import shutil
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -235,6 +236,55 @@ def get_room_video_path(room: RoomState) -> Path | None:
 def guess_video_media_type(path: Path, filename: str | None = None) -> str:
     media_type, _ = mimetypes.guess_type(filename or path.name)
     return media_type or "application/octet-stream"
+
+
+FASTSTART_EXTENSIONS = {".mp4", ".m4v", ".mov"}
+
+
+async def optimize_for_streaming(path: Path) -> None:
+    """Move the MP4/MOV moov atom to the front of the file (faststart).
+
+    iOS Safari must read the moov atom before it can start playback. Many
+    recorders/exporters write it at the end of the file, which forces the
+    browser to download the whole file first — over a slow cross-border link
+    that effectively never finishes, so the page loads but the video never
+    plays. A stream copy is cheap (no re-encode) and fixes this. If ffmpeg is
+    not installed or the remux fails for any reason, the original file is left
+    untouched.
+    """
+    if path.suffix.lower() not in FASTSTART_EXTENSIONS:
+        return
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return
+
+    optimized = path.with_name(f".faststart-{uuid.uuid4().hex}{path.suffix}")
+    try:
+        process = await asyncio.create_subprocess_exec(
+            ffmpeg,
+            "-v", "error",
+            "-y",
+            "-i", str(path),
+            "-c", "copy",
+            "-movflags", "+faststart",
+            str(optimized),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await process.wait()
+        if (
+            process.returncode == 0
+            and optimized.exists()
+            and optimized.stat().st_size > 0
+        ):
+            os.replace(optimized, path)
+    except Exception:
+        pass
+    finally:
+        with contextlib.suppress(OSError):
+            if optimized.exists():
+                optimized.unlink()
 
 
 def current_video_url(room: RoomState) -> str | None:
@@ -541,6 +591,8 @@ async def complete_upload(room_id: str, upload_id: str) -> JSONResponse:
             delete_upload_artifacts(room_id, upload_id)
             clear_other_upload_artifacts(room_id)
 
+            await optimize_for_streaming(final_path)
+
             room.video_filename = session.safe_filename
             room.video_ready = True
             room.is_playing = False
@@ -574,7 +626,13 @@ async def stream_room_video(room_id: str) -> FileResponse:
         media_type=guess_video_media_type(video_path, room.video_filename),
         filename=room.video_filename,
         content_disposition_type="inline",
-        headers={"Cache-Control": "no-store"},
+        headers={
+            # The URL is versioned with ?v=<mtime>, so the bytes are immutable
+            # for a given URL. Letting iOS cache and resume via Range requests
+            # is far more reliable on a slow link than re-downloading each time.
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "Accept-Ranges": "bytes",
+        },
     )
 
 
