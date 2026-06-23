@@ -260,6 +260,27 @@
         elements.playPause.textContent = elements.video.paused ? "播放" : "暂停";
     }
 
+    function describeVideoError() {
+        const mediaError = elements.video.error;
+        if (!mediaError) {
+            return "视频加载失败";
+        }
+
+        if (mediaError.code === mediaError.MEDIA_ERR_ABORTED) {
+            return "视频加载已取消";
+        }
+        if (mediaError.code === mediaError.MEDIA_ERR_NETWORK) {
+            return "视频下载中断，请重试";
+        }
+        if (mediaError.code === mediaError.MEDIA_ERR_DECODE) {
+            return "视频解码失败，文件编码可能不兼容";
+        }
+        if (mediaError.code === mediaError.MEDIA_ERR_SRC_NOT_SUPPORTED) {
+            return "当前设备不支持此视频格式，iPhone Safari 建议使用 MP4/M4V/MOV（H.264/AAC）";
+        }
+        return "视频加载失败";
+    }
+
     function syncDanmakuDraft(value, source = null) {
         state.danmakuDraft = value;
         if (source !== elements.danmakuInput) {
@@ -878,6 +899,12 @@
         if (state.pendingState) {
             await applyRemoteState(state.pendingState);
         }
+    });
+
+    elements.video.addEventListener("error", () => {
+        state.isVideoReady = false;
+        updateControlsAvailability();
+        setRoomStatus(describeVideoError());
     });
 
     elements.video.addEventListener("durationchange", refreshTransportUi);

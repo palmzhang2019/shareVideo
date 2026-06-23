@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import mimetypes
 import os
 import time
 import uuid
@@ -229,6 +230,11 @@ def get_room_video_path(room: RoomState) -> Path | None:
     if not room.video_filename:
         return None
     return get_room_dir(room.room_id) / room.video_filename
+
+
+def guess_video_media_type(path: Path, filename: str | None = None) -> str:
+    media_type, _ = mimetypes.guess_type(filename or path.name)
+    return media_type or "application/octet-stream"
 
 
 def current_video_url(room: RoomState) -> str | None:
@@ -565,7 +571,9 @@ async def stream_room_video(room_id: str) -> FileResponse:
 
     return FileResponse(
         path=video_path,
+        media_type=guess_video_media_type(video_path, room.video_filename),
         filename=room.video_filename,
+        content_disposition_type="inline",
         headers={"Cache-Control": "no-store"},
     )
 
