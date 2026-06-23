@@ -34,9 +34,13 @@
 
     const state = {
         ws: null,
+        hls: null,
         clientId: null,
         nickname: null,
         currentVideoUrl: null,
+        currentVideoType: null,
+        currentFallbackUrl: null,
+        currentSourceKey: null,
         hasUserGesture: false,
         pendingRemotePlay: false,
         pendingState: null,
@@ -144,6 +148,19 @@
 
     function setJoinOverlayVisible(visible) {
         elements.joinOverlay.classList.toggle("visible", visible);
+    }
+
+    function canPlayNativeHls() {
+        return elements.video.canPlayType("application/vnd.apple.mpegurl") !== "";
+    }
+
+    function destroyHlsInstance() {
+        if (!state.hls) {
+            return;
+        }
+
+        state.hls.destroy();
+        state.hls = null;
     }
 
     function suppressLocalEvents(milliseconds = 700) {
@@ -273,10 +290,10 @@
             return "视频下载中断，请重试";
         }
         if (mediaError.code === mediaError.MEDIA_ERR_DECODE) {
-            return "视频解码失败，文件编码可能不兼容";
+            return "视频解码失败，流媒体编码可能不兼容";
         }
         if (mediaError.code === mediaError.MEDIA_ERR_SRC_NOT_SUPPORTED) {
-            return "当前设备不支持此视频格式，iPhone Safari 建议使用 MP4/M4V/MOV（H.264/AAC）";
+            return "当前设备不支持此播放源，浏览器可能不支持 HLS 或回退视频格式";
         }
         return "视频加载失败";
     }
@@ -427,15 +444,89 @@
         await enterFullscreenMode();
     }
 
-    async function ensureVideoSource(videoUrl) {
-        if (!videoUrl || state.currentVideoUrl === videoUrl) {
-            return;
-        }
+    function applyDirectVideoSource(videoUrl, videoType, fallbackUrl) {
+        destroyHlsInstance();
         state.currentVideoUrl = videoUrl;
-        state.isVideoReady = true;
-        updateControlsAvailability();
+        state.currentVideoType = videoType;
+        state.currentFallbackUrl = fallbackUrl;
+        state.currentSourceKey = `${videoType || ""}|${videoUrl}|${fallbackUrl || ""}`;
         elements.video.src = videoUrl;
         elements.video.load();
+    }
+
+    function fallbackToDirectVideo(fallbackUrl) {
+        if (!fallbackUrl) {
+            return false;
+        }
+
+        applyDirectVideoSource(fallbackUrl, "video/mp4", null);
+        setRoomStatus("HLS 加载失败，已回退到 MP4 直链播放");
+        return true;
+    }
+
+    function bindHlsSource(videoUrl, fallbackUrl) {
+        if (canPlayNativeHls()) {
+            applyDirectVideoSource(videoUrl, "application/vnd.apple.mpegurl", fallbackUrl);
+            return true;
+        }
+
+        if (!window.Hls || !window.Hls.isSupported()) {
+            return fallbackToDirectVideo(fallbackUrl);
+        }
+
+        destroyHlsInstance();
+        state.currentVideoUrl = videoUrl;
+        state.currentVideoType = "application/vnd.apple.mpegurl";
+        state.currentFallbackUrl = fallbackUrl;
+        state.currentSourceKey = `application/vnd.apple.mpegurl|${videoUrl}|${fallbackUrl || ""}`;
+
+        const hls = new window.Hls({
+            enableWorker: true,
+        });
+        state.hls = hls;
+        hls.attachMedia(elements.video);
+        hls.on(window.Hls.Events.MEDIA_ATTACHED, () => {
+            hls.loadSource(videoUrl);
+        });
+        hls.on(window.Hls.Events.ERROR, (_event, data) => {
+            if (!data || !data.fatal) {
+                return;
+            }
+
+            destroyHlsInstance();
+            if (!fallbackToDirectVideo(fallbackUrl)) {
+                state.isVideoReady = false;
+                updateControlsAvailability();
+                setRoomStatus("HLS 加载失败，且当前浏览器没有可用的回退播放方式");
+            }
+        });
+        return true;
+    }
+
+    async function ensureVideoSource(source) {
+        const videoUrl = source && source.video_url;
+        const videoType = source && source.video_type;
+        const fallbackUrl = source && source.fallback_video_url;
+        const sourceKey = `${videoType || ""}|${videoUrl || ""}|${fallbackUrl || ""}`;
+
+        if (!videoUrl || state.currentSourceKey === sourceKey) {
+            return;
+        }
+
+        state.isVideoReady = true;
+        updateControlsAvailability();
+
+        if (videoType === "application/vnd.apple.mpegurl") {
+            if (!bindHlsSource(videoUrl, fallbackUrl)) {
+                state.isVideoReady = false;
+                updateControlsAvailability();
+                setRoomStatus("当前浏览器不支持 HLS 播放");
+                return;
+            }
+        } else {
+            applyDirectVideoSource(videoUrl, videoType, fallbackUrl);
+        }
+
         resetDanmakuWindow(0);
         setRoomStatus("视频已就绪，可以开始同步播放");
     }
@@ -451,7 +542,7 @@
         }
 
         if (message.video_url) {
-            await ensureVideoSource(message.video_url);
+            await ensureVideoSource(message);
         }
 
         if (elements.video.readyState < 1) {
@@ -561,7 +652,7 @@
             if (payload.type === "video_ready") {
                 setRoomStatus("视频上传完成，正在同步加载");
                 if (payload.video_url) {
-                    await ensureVideoSource(payload.video_url);
+                    await ensureVideoSource(payload);
                 }
                 return;
             }
@@ -727,7 +818,7 @@
                 setUploadStatus(uploadProgressLabel(file.name, uploadedBytes, file.size, uploadedBytes > 0));
             }
 
-            setUploadStatus(`正在提交：${file.name}`);
+            setUploadStatus(`正在生成 HLS：${file.name}`);
             await completeUploadSession(session.upload_id);
             setUploadStatus(`上传完成：${file.name} (${formatBytes(file.size)})`);
         } catch (error) {
@@ -902,6 +993,7 @@
     });
 
     elements.video.addEventListener("error", () => {
+        destroyHlsInstance();
         state.isVideoReady = false;
         updateControlsAvailability();
         setRoomStatus(describeVideoError());
