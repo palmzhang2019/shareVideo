@@ -152,10 +152,10 @@
 
     function describeStreamStatus(streamStatus) {
         if (streamStatus === "processing") {
-            return "HLS 已开始可播，服务器仍在继续生成后续分片";
+            return "正在后台转码为更兼容的格式，当前先用原视频播放";
         }
         if (streamStatus === "failed") {
-            return "HLS 生成失败，当前使用 MP4 直链播放";
+            return "转码失败，当前使用原视频直链播放";
         }
         return "视频已就绪，可以开始同步播放";
     }
@@ -483,12 +483,16 @@
     }
 
     function bindHlsSource(videoUrl, fallbackUrl) {
-        if (canPlayNativeHls()) {
-            applyDirectVideoSource(videoUrl, "application/vnd.apple.mpegurl", fallbackUrl);
-            return true;
-        }
-
+        // Prefer hls.js (MSE) wherever it is supported. Some Chromium builds
+        // report a non-empty canPlayType() for HLS ("maybe") yet their native
+        // demuxer cannot actually parse a playlist (DEMUXER_ERROR_COULD_NOT_PARSE),
+        // so native HLS is only trustworthy when hls.js is unavailable -- i.e.
+        // iOS Safari, which has no MSE for <video> but does play HLS natively.
         if (!window.Hls || !window.Hls.isSupported()) {
+            if (canPlayNativeHls()) {
+                applyDirectVideoSource(videoUrl, "application/vnd.apple.mpegurl", fallbackUrl);
+                return true;
+            }
             return fallbackToDirectVideo(fallbackUrl);
         }
 
@@ -685,13 +689,9 @@
 
             if (payload.type === "video_ready") {
                 if (payload.stream_status === "processing") {
-                    if (payload.video_type === "application/vnd.apple.mpegurl") {
-                        setRoomStatus("HLS 已开始可播，正在同步切换播放源");
-                    } else {
-                        setRoomStatus("视频上传完成，MP4 已可播放，HLS 正在后台生成");
-                    }
+                    setRoomStatus("视频上传完成，已可用原视频播放，正在后台转码兼容格式");
                 } else if (payload.stream_status === "ready") {
-                    setRoomStatus("HLS 已就绪，正在同步切换播放源");
+                    setRoomStatus("转码完成，正在切换到兼容播放源");
                 } else {
                     setRoomStatus("视频上传完成，正在同步加载");
                 }

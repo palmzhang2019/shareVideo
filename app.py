@@ -510,8 +510,12 @@ async def start_hls_transcode(
             "hls",
             "-hls_time",
             "2",
+            # VOD, not a live/event playlist: clients are only switched to HLS
+            # once transcoding has fully finished, so the manifest is complete
+            # (ends with #EXT-X-ENDLIST) and hls.js loads it once instead of
+            # reload-storming a growing playlist.
             "-hls_playlist_type",
-            "event",
+            "vod",
             "-hls_list_size",
             "0",
             "-hls_flags",
@@ -677,8 +681,11 @@ async def finalize_hls_in_background(
     try:
         if process and playlist_path and stream_root:
             relative_manifest = f"{stream_root.name}/{playlist_path.name}"
-            announced_processing = False
 
+            # Wait for the transcode to finish. We do NOT expose the manifest
+            # mid-flight: viewers stay on the MP4 fallback until HLS is a
+            # complete VOD playlist, then switch once. Polling lets us abort
+            # early if a newer upload supersedes this one.
             while True:
                 room = ensure_room(room_id)
                 if room.media_upload_id != upload_id or room.video_filename != video_filename:
@@ -686,19 +693,6 @@ async def finalize_hls_in_background(
                         process.terminate()
                     await process.wait()
                     return
-
-                if (
-                    not announced_processing
-                    and playlist_path.exists()
-                    and playlist_path.stat().st_size > 0
-                ):
-                    room.stream_manifest = relative_manifest
-                    room.stream_status = "processing"
-                    room.updated_at = now_ms()
-                    video_payload = current_video_payload(room)
-                    await broadcast_json(room, {"type": "video_ready", **video_payload})
-                    await broadcast_json(room, serialize_state(room))
-                    announced_processing = True
 
                 try:
                     await asyncio.wait_for(process.wait(), timeout=0.5)
