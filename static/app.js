@@ -630,20 +630,20 @@
 
     async function handleDanmaku(message) {
         addDanmakuToHistory(message);
-        const signature = signatureForDanmaku(message.text, message.video_time);
+        // 标记为已渲染，避免随后的历史扫描 (maybeEmitDanmaku) 把这条直播弹幕再播一次
+        state.renderedDanmakuIds.add(message.id);
 
-        if (
-            message.sender_id === state.clientId &&
-            state.optimisticDanmaku.has(signature)
-        ) {
-            state.optimisticDanmaku.delete(signature);
-            return;
+        // 自己发的弹幕已经在发送时乐观渲染过，命中乐观记录则跳过，避免重复显示
+        if (message.sender_id === state.clientId) {
+            const signature = signatureForDanmaku(message.text, message.video_time);
+            if (state.optimisticDanmaku.has(signature)) {
+                state.optimisticDanmaku.delete(signature);
+                return;
+            }
         }
 
-        if (Math.abs((elements.video.currentTime || 0) - message.video_time) <= 0.3) {
-            state.renderedDanmakuIds.add(message.id);
-            spawnDanmaku(message);
-        }
+        // 通过 WebSocket 收到的都是实时弹幕，立即展示，不受双方播放进度是否对齐的影响
+        spawnDanmaku(message);
     }
 
     async function loadHistoryDanmaku() {
