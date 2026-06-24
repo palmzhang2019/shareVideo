@@ -96,6 +96,7 @@ class ClientMeta:
     nickname: str
     ip: str = "unknown"
     user_agent: str = ""
+    joined_at: int = 0
 
 
 @dataclass
@@ -1168,6 +1169,7 @@ async def room_websocket(websocket: WebSocket, room_id: str) -> None:
         nickname=generate_nickname(),
         ip=get_client_ip(websocket),
         user_agent=websocket.headers.get("user-agent", ""),
+        joined_at=now_ms(),
     )
     CLIENTS[websocket] = client_meta
     room.clients.add(websocket)
@@ -1200,6 +1202,31 @@ async def room_websocket(websocket: WebSocket, room_id: str) -> None:
                 try:
                     position = float(payload.get("position", 0.0))
                 except (TypeError, ValueError):
+                    continue
+
+                # Guard against a freshly-joined client that fires play/pause at
+                # ~position 0 before it has synced to the room (e.g. the iOS
+                # inline player starting at 0). Honoring it would drag everyone
+                # back to the start, so ignore it during a short join grace
+                # window while the room is meaningfully ahead, and re-push the
+                # authoritative state so the stale client corrects itself.
+                JOIN_SYNC_GRACE_MS = 4000
+                if (
+                    message_type in {"play", "pause"}
+                    and position < 1.0
+                    and effective_position(room) > 1.0
+                    and now_ms() - client_meta.joined_at < JOIN_SYNC_GRACE_MS
+                ):
+                    logger.info(
+                        "ignore stale op=%s room=%s client=%s position=%.3f "
+                        "(room at %.3f within join grace)",
+                        message_type,
+                        room_id,
+                        client_meta.client_id,
+                        position,
+                        effective_position(room),
+                    )
+                    await websocket.send_json(serialize_state(room))
                     continue
 
                 # seek fires repeatedly while scrubbing, so keep it at DEBUG;

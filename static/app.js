@@ -47,6 +47,7 @@
         applyingRemote: false,
         suppressUntil: 0,
         suppressTimer: null,
+        hasSyncedRoomState: false,
         isVideoReady: false,
         isScrubbing: false,
         isPseudoFullscreen: false,
@@ -569,6 +570,19 @@
         setRoomStatus(describeStreamStatus(streamStatus));
     }
 
+    // The room's authoritative playback position right now, derived from the
+    // latest state message (advancing it by elapsed wall-clock time while the
+    // room is playing). Returns null when no room state is known yet.
+    function roomPositionFromState(message) {
+        if (!message || !message.video_ready) {
+            return null;
+        }
+        const base = message.is_playing
+            ? message.position + (Date.now() - message.server_time) / 1000
+            : message.position;
+        return Math.max(0, base);
+    }
+
     async function applyRemoteState(message) {
         state.pendingState = message;
 
@@ -587,16 +601,17 @@
             return;
         }
 
-        const targetTime = message.is_playing
-            ? message.position + (Date.now() - message.server_time) / 1000
-            : message.position;
-        const normalizedTime = Math.max(0, targetTime);
+        const normalizedTime = roomPositionFromState(message);
 
         if (Math.abs((elements.video.currentTime || 0) - normalizedTime) > 0.5) {
             suppressLocalEvents();
             elements.video.currentTime = normalizedTime;
             resetDanmakuWindow(normalizedTime);
         }
+
+        // We've now aligned the local <video> to the room's position, so local
+        // play/pause events may be broadcast as authoritative from here on.
+        state.hasSyncedRoomState = true;
 
         if (message.is_playing) {
             setRoomStatus("房间正在播放");
@@ -663,6 +678,9 @@
         const endpoint = `${protocol}://${window.location.host}/room/${encodeURIComponent(context.roomId)}/ws`;
         const socket = new WebSocket(endpoint);
         state.ws = socket;
+        // A fresh connection hasn't aligned to the room position yet; block any
+        // local play/pause from broadcasting a stale position until we re-sync.
+        state.hasSyncedRoomState = false;
 
         socket.addEventListener("open", () => {
             setRoomStatus("WebSocket 已连接，等待房间状态");
@@ -1071,15 +1089,36 @@
 
     elements.video.addEventListener("durationchange", refreshTransportUi);
 
+    // Broadcast a local play/pause. On a freshly (re)connected client the user
+    // can hit play before we've aligned to the room (notably the iOS inline
+    // player, where the play can race the initial seek). Broadcasting the raw
+    // currentTime there would be ~0 and clobber the room back to the start, so
+    // first snap to the room's last known position and broadcast that instead.
+    function broadcastTransport(type) {
+        if (!state.hasSyncedRoomState) {
+            const roomPosition = roomPositionFromState(state.pendingState);
+            if (
+                roomPosition !== null &&
+                Math.abs((elements.video.currentTime || 0) - roomPosition) > 0.5
+            ) {
+                suppressLocalEvents();
+                elements.video.currentTime = roomPosition;
+                resetDanmakuWindow(roomPosition);
+            }
+            state.hasSyncedRoomState = true;
+        }
+        sendMessage({
+            type,
+            position: elements.video.currentTime || 0,
+        });
+    }
+
     elements.video.addEventListener("play", () => {
         refreshTransportUi();
         if (localEventsBlocked()) {
             return;
         }
-        sendMessage({
-            type: "play",
-            position: elements.video.currentTime || 0,
-        });
+        broadcastTransport("play");
     });
 
     elements.video.addEventListener("pause", () => {
@@ -1087,10 +1126,7 @@
         if (localEventsBlocked()) {
             return;
         }
-        sendMessage({
-            type: "pause",
-            position: elements.video.currentTime || 0,
-        });
+        broadcastTransport("pause");
     });
 
     elements.video.addEventListener("seeking", () => {
