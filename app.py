@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import logging
 import mimetypes
 import os
 import shutil
@@ -27,6 +28,12 @@ VIDEOS_DIR = DATA_DIR / "videos"
 DATABASE_PATH = DATA_DIR / "shared_cinema.sqlite3"
 MAX_UPLOAD_CHUNK = 1024 * 1024
 CLIENT_UPLOAD_CHUNK = 8 * 1024 * 1024
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
+logger = logging.getLogger("sharevideo")
 
 ADJECTIVES = [
     "Swift",
@@ -73,6 +80,8 @@ class ClientMeta:
     room_id: str
     client_id: str
     nickname: str
+    ip: str = "unknown"
+    user_agent: str = ""
 
 
 @dataclass
@@ -110,6 +119,23 @@ class HlsVariant:
 
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def get_client_ip(conn: Request | WebSocket) -> str:
+    """Best-effort real client IP, honoring a reverse proxy if present.
+
+    When deployed behind nginx/Caddy/Cloudflare the socket peer is the proxy,
+    so the viewer's real address only shows up in X-Forwarded-For / X-Real-IP.
+    """
+    forwarded = conn.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    real = conn.headers.get("x-real-ip")
+    if real:
+        return real.strip()
+    if conn.client:
+        return conn.client.host
+    return "unknown"
 
 
 def sanitize_filename(filename: str) -> str:
@@ -614,6 +640,7 @@ async def finalize_hls_in_background(
 ) -> None:
     stream_manifest: str | None = None
     stream_root: Path | None = None
+    logger.info("hls transcode start room=%s file=%s", room_id, video_filename)
     try:
         process, playlist_path, stream_root = await start_hls_transcode(
             source_path,
@@ -623,6 +650,7 @@ async def finalize_hls_in_background(
     except asyncio.CancelledError:
         raise
     except Exception:
+        logger.exception("hls transcode failed to start room=%s file=%s", room_id, video_filename)
         process = None
         playlist_path = None
 
@@ -675,9 +703,17 @@ async def finalize_hls_in_background(
     if stream_manifest:
         room.stream_manifest = stream_manifest
         room.stream_status = "ready"
+        logger.info("hls transcode ready room=%s file=%s manifest=%s", room_id, video_filename, stream_manifest)
     else:
         room.stream_manifest = None
         room.stream_status = "failed"
+        returncode = process.returncode if process else None
+        logger.warning(
+            "hls transcode failed room=%s file=%s returncode=%s; viewers fall back to MP4",
+            room_id,
+            video_filename,
+            returncode,
+        )
         if stream_root:
             shutil.rmtree(stream_root, ignore_errors=True)
 
@@ -706,6 +742,28 @@ def schedule_room_hls_generation(room: RoomState, upload_id: str, source_path: P
     HLS_TASKS[room.room_id] = asyncio.create_task(runner())
 
 
+def schedule_room_faststart(
+    room_id: str, upload_id: str, video_filename: str, path: Path
+) -> None:
+    """Move the MP4 moov atom to the front in the background.
+
+    This only affects the MP4 *fallback* download, so there is no reason to
+    block the upload response (or the HLS transcode, which reads the same file
+    via a separate fd) on it. Once it finishes we re-broadcast state so the
+    fallback URL picks up the new mtime/version.
+    """
+
+    async def runner() -> None:
+        await optimize_for_streaming(path)
+        room = ensure_room(room_id)
+        if room.media_upload_id != upload_id or room.video_filename != video_filename:
+            return
+        room.updated_at = now_ms()
+        await broadcast_json(room, serialize_state(room))
+
+    asyncio.create_task(runner())
+
+
 async def update_room_state(room: RoomState, is_playing: bool | None, position: float) -> None:
     current_ms = now_ms()
     room.position = max(position, 0.0)
@@ -719,6 +777,19 @@ async def update_room_state(room: RoomState, is_playing: bool | None, position: 
 async def on_startup() -> None:
     VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
     await init_db(DATABASE_PATH)
+
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    if ffmpeg and ffprobe:
+        logger.info("ffmpeg detected (ffmpeg=%s ffprobe=%s); HLS transcoding enabled", ffmpeg, ffprobe)
+    else:
+        logger.warning(
+            "ffmpeg/ffprobe NOT found (ffmpeg=%s ffprobe=%s). HLS transcoding and MP4 "
+            "faststart are DISABLED -- viewers fall back to the raw upload, which on iOS "
+            "or slow links may fail to play or require a full download. Install ffmpeg.",
+            ffmpeg,
+            ffprobe,
+        )
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -935,8 +1006,6 @@ async def complete_upload(room_id: str, upload_id: str) -> JSONResponse:
             remove_stale_room_media(room_dir, keep_paths={final_path})
             cancel_room_hls_task(room_id)
 
-            await optimize_for_streaming(final_path)
-
             room.media_upload_id = upload_id
             room.video_filename = session.safe_filename
             room.stream_manifest = None
@@ -948,8 +1017,20 @@ async def complete_upload(room_id: str, upload_id: str) -> JSONResponse:
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"Finalize failed: {exc}") from exc
 
+    logger.info(
+        "upload complete room=%s file=%s bytes=%d ffmpeg=%s",
+        room_id,
+        session.safe_filename,
+        uploaded_bytes,
+        ffmpeg_available,
+    )
+
+    # Run HLS transcode and MP4 faststart concurrently instead of waiting for
+    # faststart first: HLS is the primary source, and faststart only matters for
+    # the MP4 fallback, so blocking the slower encode behind it wastes time.
     if ffmpeg_available:
         schedule_room_hls_generation(room, upload_id, final_path)
+    schedule_room_faststart(room_id, upload_id, session.safe_filename, final_path)
 
     video_payload = current_video_payload(room)
     await broadcast_json(room, {"type": "video_ready", **video_payload})
@@ -965,11 +1046,20 @@ async def complete_upload(room_id: str, upload_id: str) -> JSONResponse:
 
 
 @app.get("/room/{room_id}/video")
-async def stream_room_video(room_id: str) -> FileResponse:
+async def stream_room_video(room_id: str, request: Request) -> FileResponse:
     room = ensure_room(room_id)
     video_path = get_room_video_path(room)
     if not room.video_ready or not video_path or not video_path.exists():
         raise HTTPException(status_code=404, detail="No video uploaded for this room.")
+
+    logger.info(
+        "serve mp4-fallback room=%s ip=%s file=%s range=%r ua=%r",
+        room_id,
+        get_client_ip(request),
+        room.video_filename,
+        request.headers.get("range", ""),
+        request.headers.get("user-agent", ""),
+    )
 
     return FileResponse(
         path=video_path,
@@ -987,7 +1077,9 @@ async def stream_room_video(room_id: str) -> FileResponse:
 
 
 @app.get("/room/{room_id}/stream/{stream_path:path}")
-async def stream_room_hls_asset(room_id: str, stream_path: str) -> FileResponse:
+async def stream_room_hls_asset(
+    room_id: str, stream_path: str, request: Request
+) -> FileResponse:
     room = ensure_room(room_id)
     if not room.video_ready:
         raise HTTPException(status_code=404, detail="No video uploaded for this room.")
@@ -1003,6 +1095,17 @@ async def stream_room_hls_asset(room_id: str, stream_path: str) -> FileResponse:
 
     if not asset_path.exists() or not asset_path.is_file() or asset_path.name.startswith("."):
         raise HTTPException(status_code=404, detail="Asset not found.")
+
+    # Log only manifest fetches, not every .ts segment, to keep the log readable
+    # while still showing that a viewer actually started the HLS stream.
+    if asset_path.suffix == ".m3u8":
+        logger.info(
+            "serve hls-manifest room=%s ip=%s asset=%s ua=%r",
+            room_id,
+            get_client_ip(request),
+            stream_path,
+            request.headers.get("user-agent", ""),
+        )
 
     return FileResponse(
         path=asset_path,
@@ -1031,9 +1134,20 @@ async def room_websocket(websocket: WebSocket, room_id: str) -> None:
         room_id=room_id,
         client_id=str(uuid.uuid4()),
         nickname=generate_nickname(),
+        ip=get_client_ip(websocket),
+        user_agent=websocket.headers.get("user-agent", ""),
     )
     CLIENTS[websocket] = client_meta
     room.clients.add(websocket)
+
+    logger.info(
+        "viewer joined room=%s ip=%s nickname=%s client=%s ua=%r",
+        room_id,
+        client_meta.ip,
+        client_meta.nickname,
+        client_meta.client_id,
+        client_meta.user_agent,
+    )
 
     await websocket.send_json(
         {
@@ -1056,12 +1170,35 @@ async def room_websocket(websocket: WebSocket, room_id: str) -> None:
                 except (TypeError, ValueError):
                     continue
 
+                logger.info(
+                    "op=%s room=%s ip=%s client=%s position=%.3f",
+                    message_type,
+                    room_id,
+                    client_meta.ip,
+                    client_meta.client_id,
+                    position,
+                )
+
                 if message_type == "play":
                     await update_room_state(room, True, position)
                 elif message_type == "pause":
                     await update_room_state(room, False, position)
                 else:
                     await update_room_state(room, None, position)
+
+            elif message_type == "client_log":
+                # Playback diagnostics reported by the browser (e.g. the video
+                # element errored). Logged with the viewer's IP so a "can't play"
+                # report can be traced from the server side.
+                logger.warning(
+                    "client_log room=%s ip=%s client=%s event=%s detail=%r ua=%r",
+                    room_id,
+                    client_meta.ip,
+                    client_meta.client_id,
+                    str(payload.get("event", "")),
+                    str(payload.get("detail", ""))[:500],
+                    client_meta.user_agent,
+                )
 
             elif message_type == "danmaku":
                 text = str(payload.get("text", "")).strip()
@@ -1098,4 +1235,10 @@ async def room_websocket(websocket: WebSocket, room_id: str) -> None:
     finally:
         room.clients.discard(websocket)
         CLIENTS.pop(websocket, None)
+        logger.info(
+            "viewer left room=%s ip=%s client=%s",
+            room_id,
+            client_meta.ip,
+            client_meta.client_id,
+        )
         await broadcast_viewers(room)

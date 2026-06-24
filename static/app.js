@@ -210,6 +210,14 @@
         state.ws.send(JSON.stringify(payload));
     }
 
+    function reportClientLog(event, detail) {
+        sendMessage({
+            type: "client_log",
+            event,
+            detail: typeof detail === "string" ? detail : JSON.stringify(detail),
+        });
+    }
+
     function pruneOptimisticDanmaku() {
         const now = Date.now();
         for (const [key, expiresAt] of state.optimisticDanmaku.entries()) {
@@ -502,6 +510,14 @@
             if (!data || !data.fatal) {
                 return;
             }
+
+            reportClientLog("hls_error", {
+                type: data.type,
+                details: data.details,
+                videoUrl,
+                fallbackUrl: fallbackUrl || null,
+                response: data.response ? data.response.code : null,
+            });
 
             destroyHlsInstance();
             if (!fallbackToDirectVideo(fallbackUrl)) {
@@ -1018,6 +1034,16 @@
     });
 
     elements.video.addEventListener("error", () => {
+        const mediaError = elements.video.error;
+        reportClientLog("video_error", {
+            message: describeVideoError(),
+            code: mediaError ? mediaError.code : null,
+            mediaMessage: mediaError ? mediaError.message : null,
+            videoType: state.currentVideoType,
+            videoUrl: state.currentVideoUrl,
+            networkState: elements.video.networkState,
+            readyState: elements.video.readyState,
+        });
         destroyHlsInstance();
         state.isVideoReady = false;
         updateControlsAvailability();
