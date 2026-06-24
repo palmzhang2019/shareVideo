@@ -3,6 +3,7 @@ import contextlib
 import hashlib
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import mimetypes
 import os
 import shutil
@@ -29,9 +30,22 @@ DATABASE_PATH = DATA_DIR / "shared_cinema.sqlite3"
 MAX_UPLOAD_CHUNK = 1024 * 1024
 CLIENT_UPLOAD_CHUNK = 8 * 1024 * 1024
 
+LOG_DIR = BASE_DIR / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE = LOG_DIR / "sharevideo.log"
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        RotatingFileHandler(
+            LOG_FILE,
+            maxBytes=10 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        ),
+    ],
 )
 logger = logging.getLogger("sharevideo")
 
@@ -104,6 +118,7 @@ ROOMS: dict[str, RoomState] = {}
 CLIENTS: dict[WebSocket, ClientMeta] = {}
 UPLOAD_LOCKS: dict[str, asyncio.Lock] = {}
 HLS_TASKS: dict[str, asyncio.Task[None]] = {}
+BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
 HLS_PLAYLIST = "index.m3u8"
 
 
@@ -532,9 +547,14 @@ def current_video_payload(room: RoomState) -> dict[str, str | None]:
     stream_path = get_room_manifest_path(room)
 
     if stream_path and stream_path.exists() and room.stream_manifest:
-        version = stream_path.stat().st_mtime_ns
+        # The manifest URL is deliberately NOT versioned with mtime: the path
+        # already contains the per-upload id (hls-<upload_id>/...), so it is
+        # unique per upload yet stable across the processing -> ready transition.
+        # A changing URL would make the client rebind (restarting playback) every
+        # time the manifest grows. The manifest is served no-store, so the client
+        # always revalidates and eventually sees #EXT-X-ENDLIST and stops polling.
         return {
-            "video_url": f"/room/{quote(room.room_id)}/stream/{room.stream_manifest}?v={version}",
+            "video_url": f"/room/{quote(room.room_id)}/stream/{room.stream_manifest}",
             "video_type": "application/vnd.apple.mpegurl",
             "fallback_video_url": fallback_video_url,
             "stream_status": room.stream_status,
@@ -749,19 +769,21 @@ def schedule_room_faststart(
 
     This only affects the MP4 *fallback* download, so there is no reason to
     block the upload response (or the HLS transcode, which reads the same file
-    via a separate fd) on it. Once it finishes we re-broadcast state so the
-    fallback URL picks up the new mtime/version.
+    via a separate fd) on it. We deliberately do NOT broadcast afterwards:
+    clients no longer dedup on the fallback URL, so re-broadcasting only the
+    changed fallback version would needlessly restart playback for everyone.
     """
 
     async def runner() -> None:
-        await optimize_for_streaming(path)
-        room = ensure_room(room_id)
-        if room.media_upload_id != upload_id or room.video_filename != video_filename:
-            return
-        room.updated_at = now_ms()
-        await broadcast_json(room, serialize_state(room))
+        try:
+            await optimize_for_streaming(path)
+        except Exception:
+            logger.exception("faststart failed room=%s file=%s", room_id, video_filename)
 
-    asyncio.create_task(runner())
+    task = asyncio.create_task(runner())
+    # Keep a reference so the task isn't garbage-collected mid-flight.
+    BACKGROUND_TASKS.add(task)
+    task.add_done_callback(BACKGROUND_TASKS.discard)
 
 
 async def update_room_state(room: RoomState, is_playing: bool | None, position: float) -> None:
@@ -1052,14 +1074,19 @@ async def stream_room_video(room_id: str, request: Request) -> FileResponse:
     if not room.video_ready or not video_path or not video_path.exists():
         raise HTTPException(status_code=404, detail="No video uploaded for this room.")
 
-    logger.info(
-        "serve mp4-fallback room=%s ip=%s file=%s range=%r ua=%r",
-        room_id,
-        get_client_ip(request),
-        room.video_filename,
-        request.headers.get("range", ""),
-        request.headers.get("user-agent", ""),
-    )
+    # Players issue many Range requests per playback; only log the opening one
+    # (no Range, or a range starting at byte 0) so the log shows that a viewer
+    # started the MP4 fallback without flooding on every chunk.
+    range_header = request.headers.get("range", "")
+    if not range_header or range_header.startswith("bytes=0-"):
+        logger.info(
+            "serve mp4-fallback room=%s ip=%s file=%s range=%r ua=%r",
+            room_id,
+            get_client_ip(request),
+            room.video_filename,
+            range_header,
+            request.headers.get("user-agent", ""),
+        )
 
     return FileResponse(
         path=video_path,
@@ -1096,9 +1123,11 @@ async def stream_room_hls_asset(
     if not asset_path.exists() or not asset_path.is_file() or asset_path.name.startswith("."):
         raise HTTPException(status_code=404, detail="Asset not found.")
 
+    is_manifest = asset_path.suffix == ".m3u8"
+
     # Log only manifest fetches, not every .ts segment, to keep the log readable
     # while still showing that a viewer actually started the HLS stream.
-    if asset_path.suffix == ".m3u8":
+    if is_manifest:
         logger.info(
             "serve hls-manifest room=%s ip=%s asset=%s ua=%r",
             room_id,
@@ -1107,13 +1136,22 @@ async def stream_room_hls_asset(
             request.headers.get("user-agent", ""),
         )
 
+    # The manifest mutates while transcoding (segments are appended, then
+    # #EXT-X-ENDLIST is written), so it must never be cached -- otherwise the
+    # client keeps replaying a stale, endless live playlist. Segments are
+    # immutable once written and safe to cache aggressively.
+    if is_manifest:
+        cache_control = "no-store, no-cache, must-revalidate"
+    else:
+        cache_control = "public, max-age=31536000, immutable"
+
     return FileResponse(
         path=asset_path,
         media_type=guess_video_media_type(asset_path),
         filename=asset_path.name,
         content_disposition_type="inline",
         headers={
-            "Cache-Control": "public, max-age=31536000, immutable",
+            "Cache-Control": cache_control,
         },
     )
 
@@ -1170,7 +1208,10 @@ async def room_websocket(websocket: WebSocket, room_id: str) -> None:
                 except (TypeError, ValueError):
                     continue
 
-                logger.info(
+                # seek fires repeatedly while scrubbing, so keep it at DEBUG;
+                # play/pause are the meaningful, low-frequency actions.
+                op_log = logger.info if message_type in {"play", "pause"} else logger.debug
+                op_log(
                     "op=%s room=%s ip=%s client=%s position=%.3f",
                     message_type,
                     room_id,

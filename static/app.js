@@ -467,7 +467,7 @@
         state.currentVideoUrl = videoUrl;
         state.currentVideoType = videoType;
         state.currentFallbackUrl = fallbackUrl;
-        state.currentSourceKey = `${videoType || ""}|${videoUrl}|${fallbackUrl || ""}`;
+        state.currentSourceKey = `${videoType || ""}|${videoUrl}`;
         elements.video.src = videoUrl;
         elements.video.load();
     }
@@ -496,7 +496,7 @@
         state.currentVideoUrl = videoUrl;
         state.currentVideoType = "application/vnd.apple.mpegurl";
         state.currentFallbackUrl = fallbackUrl;
-        state.currentSourceKey = `application/vnd.apple.mpegurl|${videoUrl}|${fallbackUrl || ""}`;
+        state.currentSourceKey = `application/vnd.apple.mpegurl|${videoUrl}`;
 
         const hls = new window.Hls({
             enableWorker: true,
@@ -534,7 +534,14 @@
         const videoType = source && source.video_type;
         const fallbackUrl = source && source.fallback_video_url;
         const streamStatus = source && source.stream_status;
-        const sourceKey = `${videoType || ""}|${videoUrl || ""}|${fallbackUrl || ""}`;
+        // The dedup key intentionally excludes the fallback URL: a fallback whose
+        // ?v= version changed (e.g. after the MP4 faststart remux) must not force
+        // a reload of the source the viewer is already watching.
+        const sourceKey = `${videoType || ""}|${videoUrl || ""}`;
+
+        // Keep the latest fallback available for the <video> error handler even
+        // when we don't rebind.
+        state.currentFallbackUrl = fallbackUrl;
 
         if (!videoUrl || state.currentSourceKey === sourceKey) {
             return;
@@ -1044,6 +1051,18 @@
             networkState: elements.video.networkState,
             readyState: elements.video.readyState,
         });
+
+        // The active source failed. If it wasn't already the MP4 fallback and we
+        // have one, switch to it. This covers native HLS playback (iOS Safari),
+        // whose failures only surface as a <video> error, not an hls.js event.
+        if (
+            state.currentFallbackUrl &&
+            state.currentVideoUrl !== state.currentFallbackUrl &&
+            fallbackToDirectVideo(state.currentFallbackUrl)
+        ) {
+            return;
+        }
+
         destroyHlsInstance();
         state.isVideoReady = false;
         updateControlsAvailability();
