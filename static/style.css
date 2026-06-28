@@ -38,6 +38,17 @@ body.is-fullscreen {
     overflow: hidden;
 }
 
+/* iOS Safari ignores `overflow: hidden` on <body> for touch scrolling, so the
+   page behind the pseudo-fullscreen overlay can still be dragged. Pinning the
+   body removes it from the scroll flow entirely; the fixed, full-viewport shell
+   covers it, so the visual result is a stable, non-scrolling fullscreen. */
+body.is-fullscreen {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    overscroll-behavior: none;
+}
+
 button,
 input {
     font: inherit;
@@ -346,9 +357,19 @@ input {
 .player-shell.pseudo-fullscreen {
     position: fixed;
     inset: 0;
+    /* 100vh on iOS Safari includes the area behind the toolbar, so the shell
+       overflows the visible viewport and the control bar gets pushed off /
+       clipped. 100dvh tracks the *visible* viewport (toolbar excluded), giving a
+       true fullscreen fit. The plain 100vh/100vw lines are fallbacks for
+       browsers that don't support the dynamic viewport units. */
     width: 100vw;
+    width: 100dvw;
     height: 100vh;
+    height: 100dvh;
     z-index: 9999;
+    /* Stop iOS rubber-band scrolling from peeking at the page behind the
+       overlay while in pseudo-fullscreen. */
+    overscroll-behavior: none;
 }
 
 .primary-btn,
