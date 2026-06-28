@@ -9,6 +9,7 @@ import os
 import shutil
 import time
 import uuid
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -535,6 +536,95 @@ async def start_hls_transcode(
     return (process, playlist_path, stream_root)
 
 
+# Files permitted inside an uploaded, pre-transcoded HLS bundle. Anything else
+# (scripts, archives, etc.) is rejected so the upload can only ever be served as
+# static media by the /stream route.
+HLS_BUNDLE_ALLOWED_SUFFIXES = {
+    ".m3u8", ".ts", ".m4s", ".mp4", ".m4a", ".aac", ".vtt", ".key",
+}
+HLS_BUNDLE_MAX_FILES = 20000
+HLS_BUNDLE_MAX_TOTAL_BYTES = 5 * 1024 * 1024 * 1024  # 5 GiB uncompressed
+
+
+def find_hls_entry_manifest(hls_dir: Path) -> Path | None:
+    """Pick the playlist a player should load first: a master playlist (one that
+    lists variant streams) when present, otherwise the shallowest, most
+    conventionally named .m3u8."""
+    manifests = list(hls_dir.rglob("*.m3u8"))
+    if not manifests:
+        return None
+
+    masters: list[Path] = []
+    for manifest in manifests:
+        try:
+            text = manifest.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if "#EXT-X-STREAM-INF" in text:
+            masters.append(manifest)
+
+    candidates = masters or manifests
+
+    def rank(path: Path) -> tuple[int, int, str]:
+        depth = len(path.relative_to(hls_dir).parts)
+        preferred = 0 if path.name in {"index.m3u8", "master.m3u8", "playlist.m3u8"} else 1
+        return (depth, preferred, str(path))
+
+    return min(candidates, key=rank)
+
+
+def extract_hls_bundle(zip_path: Path, dest_dir: Path, room_dir: Path) -> str:
+    """Extract an uploaded HLS .zip into dest_dir and return the room-relative
+    path to its entry manifest. Guards against zip-slip, disallowed file types,
+    and oversized/zip-bomb archives. Raises ValueError on a malformed bundle."""
+    if dest_dir.exists():
+        shutil.rmtree(dest_dir, ignore_errors=True)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_root = dest_dir.resolve()
+
+    total_bytes = 0
+    file_count = 0
+    try:
+        with zipfile.ZipFile(zip_path) as archive:
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+
+                name = info.filename
+                parts = Path(name).parts
+                # Ignore macOS archive cruft and dotfiles outright.
+                if "__MACOSX" in parts or Path(name).name.startswith("."):
+                    continue
+                if name.startswith("/") or ".." in parts:
+                    raise ValueError(f"unsafe path in bundle: {name!r}")
+                if Path(name).suffix.lower() not in HLS_BUNDLE_ALLOWED_SUFFIXES:
+                    raise ValueError(f"disallowed file in bundle: {name!r}")
+
+                file_count += 1
+                total_bytes += info.file_size
+                if file_count > HLS_BUNDLE_MAX_FILES:
+                    raise ValueError("bundle contains too many files")
+                if total_bytes > HLS_BUNDLE_MAX_TOTAL_BYTES:
+                    raise ValueError("bundle is too large when uncompressed")
+
+                target = (dest_dir / name).resolve()
+                try:
+                    target.relative_to(dest_root)
+                except ValueError as exc:
+                    raise ValueError(f"unsafe path in bundle: {name!r}") from exc
+
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(info) as source, open(target, "wb") as handle:
+                    shutil.copyfileobj(source, handle, 1024 * 1024)
+    except zipfile.BadZipFile as exc:
+        raise ValueError("not a valid zip archive") from exc
+
+    manifest = find_hls_entry_manifest(dest_dir)
+    if manifest is None:
+        raise ValueError("bundle has no .m3u8 manifest")
+    return str(manifest.relative_to(room_dir))
+
+
 def current_fallback_video_url(room: RoomState) -> str | None:
     if not room.video_ready:
         return None
@@ -621,15 +711,23 @@ def ensure_room(room_id: str) -> RoomState:
             room.video_filename = latest.name
             room.video_ready = True
 
-        manifests = [
-            path
-            for path in room_dir.glob(f"hls-*/{HLS_PLAYLIST}")
-            if path.is_file()
-        ]
-        if manifests:
-            latest_manifest = max(manifests, key=lambda item: item.stat().st_mtime_ns)
+        # Recover an HLS source after a restart (server-transcoded output or an
+        # uploaded bundle). The entry manifest may be a master playlist or live in
+        # a subfolder, so resolve each hls-* dir's entry rather than assuming
+        # index.m3u8 -- and a pure-HLS bundle room has no loose file, so the
+        # manifest alone makes it ready.
+        hls_entries = []
+        for hls_dir in room_dir.glob("hls-*"):
+            if not hls_dir.is_dir():
+                continue
+            entry = find_hls_entry_manifest(hls_dir)
+            if entry is not None:
+                hls_entries.append(entry)
+        if hls_entries:
+            latest_manifest = max(hls_entries, key=lambda item: item.stat().st_mtime_ns)
             room.stream_manifest = str(latest_manifest.relative_to(room_dir))
             room.stream_status = "ready"
+            room.video_ready = True
         elif room.video_ready:
             room.stream_status = "none"
 
@@ -1016,38 +1114,76 @@ async def complete_upload(room_id: str, upload_id: str) -> JSONResponse:
                 detail="Upload is incomplete.",
             )
 
+        # A .zip upload is a pre-transcoded HLS bundle: extract and serve it as
+        # static HLS, skipping the server-side ffmpeg transcode entirely. This is
+        # how a weak (e.g. Oracle free-tier) host avoids transcoding altogether.
+        is_hls_bundle = session.safe_filename.lower().endswith(".zip")
+
         try:
             os.replace(temp_path, final_path)
             delete_upload_artifacts(room_id, upload_id)
             clear_other_upload_artifacts(room_id)
-            remove_stale_room_media(room_dir, keep_paths={final_path})
             cancel_room_hls_task(room_id)
 
-            room.media_upload_id = upload_id
-            room.video_filename = session.safe_filename
-            room.stream_manifest = None
-            room.stream_status = "processing" if ffmpeg_available else "none"
-            room.video_ready = True
-            room.is_playing = False
-            room.position = 0.0
-            room.updated_at = now_ms()
+            if is_hls_bundle:
+                hls_dir = get_room_hls_dir(room_id, upload_id)
+                try:
+                    manifest_rel = extract_hls_bundle(final_path, hls_dir, room_dir)
+                except ValueError as exc:
+                    shutil.rmtree(hls_dir, ignore_errors=True)
+                    remove_path(final_path)
+                    raise HTTPException(
+                        status_code=400, detail=f"Invalid HLS bundle: {exc}"
+                    ) from exc
+                # The archive is redundant once unpacked; drop it so we don't keep
+                # a second full copy on a small disk.
+                remove_path(final_path)
+                remove_stale_room_media(room_dir, keep_paths={hls_dir})
+
+                room.media_upload_id = upload_id
+                room.video_filename = None
+                room.stream_manifest = manifest_rel
+                room.stream_status = "ready"
+                room.video_ready = True
+                room.is_playing = False
+                room.position = 0.0
+                room.updated_at = now_ms()
+            else:
+                remove_stale_room_media(room_dir, keep_paths={final_path})
+
+                room.media_upload_id = upload_id
+                room.video_filename = session.safe_filename
+                room.stream_manifest = None
+                room.stream_status = "processing" if ffmpeg_available else "none"
+                room.video_ready = True
+                room.is_playing = False
+                room.position = 0.0
+                room.updated_at = now_ms()
+        except HTTPException:
+            raise
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"Finalize failed: {exc}") from exc
 
     logger.info(
-        "upload complete room=%s file=%s bytes=%d ffmpeg=%s",
+        "upload complete room=%s file=%s bytes=%d ffmpeg=%s hls_bundle=%s",
         room_id,
         session.safe_filename,
         uploaded_bytes,
         ffmpeg_available,
+        is_hls_bundle,
     )
 
-    # Run HLS transcode and MP4 faststart concurrently instead of waiting for
-    # faststart first: HLS is the primary source, and faststart only matters for
-    # the MP4 fallback, so blocking the slower encode behind it wastes time.
-    if ffmpeg_available:
-        schedule_room_hls_generation(room, upload_id, final_path)
-    schedule_room_faststart(room_id, upload_id, session.safe_filename, final_path)
+    if is_hls_bundle:
+        logger.info(
+            "hls bundle ready room=%s manifest=%s", room_id, room.stream_manifest
+        )
+    else:
+        # Run HLS transcode and MP4 faststart concurrently instead of waiting for
+        # faststart first: HLS is the primary source, and faststart only matters
+        # for the MP4 fallback, so blocking the slower encode behind it wastes time.
+        if ffmpeg_available:
+            schedule_room_hls_generation(room, upload_id, final_path)
+        schedule_room_faststart(room_id, upload_id, session.safe_filename, final_path)
 
     video_payload = current_video_payload(room)
     await broadcast_json(room, {"type": "video_ready", **video_payload})
